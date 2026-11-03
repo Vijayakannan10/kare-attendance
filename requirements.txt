@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pyjwt
+pillow
+numpy
+dlib-bin
+face_recognition
+setuptools<81
+opencv-python-headless
