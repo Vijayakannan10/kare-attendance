@@ -8,3 +8,6 @@ dlib-bin
 face_recognition_models
 setuptools<81
 opencv-python-headless
+pdfplumber
+openpyxl
+
