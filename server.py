@@ -81,6 +81,8 @@ def init_db():
             SELECT date, 'General', subject, reg_no, name, status, staff_id FROM attendance""")
 
 
+import persist
+persist.restore(DB_FILE)
 init_db()
 
 
@@ -894,6 +896,7 @@ def _backup_loop():
 
 @app.on_event("startup")
 def start_backups():
+    persist.start(DB_FILE)
     threading.Thread(target=_backup_loop, daemon=True).start()
 
 
