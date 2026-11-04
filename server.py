@@ -25,6 +25,9 @@ MARGIN = 0.06       # best match must beat the second-best student by this much,
 DUP_DIST = 0.35     # a new face this close to another student's face = probably the same person
 CHECK_QUALITY = True            # set False to switch the photo checks off
 MIN_FACE, MIN_SHARP, MAX_YAW = 90, 12.0, 0.40
+# Photo-scan memory use. On small free servers set SCAN_MAX_SIDE=1280 and SCAN_UPSAMPLE=1.
+SCAN_MAX_SIDE = int(os.environ.get("SCAN_MAX_SIDE", "3000"))
+SCAN_UPSAMPLE = int(os.environ.get("SCAN_UPSAMPLE", "2"))
 LAST_SCAN = {}      # (staff, class) -> {reg_no: status the computer chose}, used for accuracy
 
 app = FastAPI(title="Face Attendance")
@@ -531,9 +534,9 @@ async def scan(class_name: str = Form(...),
         font = ImageFont.load_default()
 
     for f in photos:
-        pil = read_image(await f.read(), 3000)
+        pil = read_image(await f.read(), SCAN_MAX_SIDE)
         img = np.array(pil)
-        locs = face_recognition.face_locations(img, number_of_times_to_upsample=2)
+        locs = face_recognition.face_locations(img, number_of_times_to_upsample=SCAN_UPSAMPLE)
         encs = face_recognition.face_encodings(img, locs, num_jitters=2)
         draw = ImageDraw.Draw(pil)
         for (t, r_, b, l), e in zip(locs, encs):
