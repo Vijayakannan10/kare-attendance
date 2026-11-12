@@ -17,11 +17,11 @@ from pydantic import BaseModel
 
 DB_FILE = "attendance.db"
 SECRET = os.environ.get("JWT_SECRET", "change-this-secret-in-real-use")
-STRICT = 0.45   # <= sure match  -> present
-LOOSE = 0.55    # <= maybe       -> check (teacher confirms)
+STRICT = float(os.environ.get("FACE_STRICT", "0.45"))   # <= sure match  -> present
+LOOSE = float(os.environ.get("FACE_LOOSE", "0.55"))    # <= maybe       -> check (teacher confirms)
 HAS_FACE = "(encodings IS NOT NULL AND encodings NOT IN ('', '[]'))"
 
-MARGIN = 0.06       # best match must beat the second-best student by this much, else "check"
+MARGIN = float(os.environ.get("FACE_MARGIN", "0.06"))       # best match must beat the second-best student by this much, else "check"
 DUP_DIST = 0.35     # a new face this close to another student's face = probably the same person
 CHECK_QUALITY = True            # set False to switch the photo checks off
 MIN_FACE, MIN_SHARP, MAX_YAW = 90, 12.0, 0.40
@@ -295,6 +295,69 @@ def two_nearest(d_all, starts, ids):
     return best_i, best_d, None, 9.9
 
 
+def encode_from_original(orig, small, locs, small_arr):
+    """Faces are FOUND on the small copy but MEASURED on the full-quality photo.
+    A person standing far away is only ~100 px wide in the small copy but 300+ px in the original,
+    so this gives a much sharper face print. Falls back to the small copy if anything goes wrong."""
+    scale = orig.width / max(1, small.width)
+    out = []
+    for (t, r, b, l) in locs:
+        try:
+            if scale <= 1.01:
+                raise ValueError("no bigger copy")
+            T, R, B, L = (int(v * scale) for v in (t, r, b, l))
+            m = int(max(R - L, B - T) * 0.5)
+            ct, cl = max(0, T - m), max(0, L - m)
+            cb, cr = min(orig.height, B + m), min(orig.width, R + m)
+            crop = orig.crop((cl, ct, cr, cb))
+            loc = (T - ct, R - cl, B - ct, L - cl)
+            big = max(crop.size)
+            if big > 700:                                    # keep it light: 700 px is plenty
+                f = 700 / big
+                crop = crop.resize((max(1, int(crop.width * f)), max(1, int(crop.height * f))))
+                loc = tuple(int(v * f) for v in loc)
+            e = face_recognition.face_encodings(np.array(crop), [loc], num_jitters=2)
+            if not e:
+                raise ValueError("no encoding")
+            out.append(e[0])
+        except Exception:
+            out.append(face_recognition.face_encodings(small_arr, [(t, r, b, l)], num_jitters=2)[0])
+    return out
+
+
+def match_faces(P, loose, margin):
+    """P = faces x students distance matrix (smaller = more alike) for ONE photo.
+    One face can only be one student and one student only one face: the closest pairs are
+    settled first. A student already explained by another face is not counted as a rival,
+    so "(like X)" only shows when X is really still a possible match.
+    Returns, per face, (student column, distance, too_close_to_rival, rival column) or None."""
+    P = np.asarray(P, dtype=float)
+    nf, ns = P.shape
+    taken, face_to = set(), {}
+    for flat in np.argsort(P, axis=None):
+        f, c = divmod(int(flat), ns)
+        if P[f, c] > loose:
+            break
+        if f in face_to or c in taken:
+            continue
+        face_to[f] = c
+        taken.add(c)
+    out = []
+    for f in range(nf):
+        if f not in face_to:
+            out.append(None)
+            continue
+        c = face_to[f]
+        rivals = [x for x in range(ns) if x != c and x not in taken]
+        if rivals:
+            j = min(rivals, key=lambda x: P[f, x])
+            d2 = float(P[f, j])
+        else:
+            j, d2 = None, 9.9
+        out.append((c, float(P[f, c]), (d2 - float(P[f, c])) < margin, j))
+    return out
+
+
 # ---------- class list import (PDF / Excel / CSV) ----------
 def clean_name(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip().title()
@@ -534,32 +597,41 @@ async def scan(class_name: str = Form(...),
         font = ImageFont.load_default()
 
     for f in photos:
-        pil = read_image(await f.read(), SCAN_MAX_SIDE)
+        raw = await f.read()
+        orig = ImageOps.exif_transpose(Image.open(io.BytesIO(raw)).convert("RGB"))   # full quality copy
+        pil = orig.copy()
+        pil.thumbnail((SCAN_MAX_SIDE, SCAN_MAX_SIDE))          # smaller copy: finding faces is cheap here
         img = np.array(pil)
         locs = face_recognition.face_locations(img, number_of_times_to_upsample=SCAN_UPSAMPLE)
-        encs = face_recognition.face_encodings(img, locs, num_jitters=2)
+        encs = encode_from_original(orig, pil, locs, img)
         draw = ImageDraw.Draw(pil)
-        for (t, r_, b, l), e in zip(locs, encs):
-            d_all = face_recognition.face_distance(known, e)
-            i, d, j, d2 = two_nearest(d_all, starts, ids)
-            if d <= LOOSE:
-                close = (d2 - d) < MARGIN          # another student looks almost as similar
+        if locs:
+            P = np.array([np.minimum.reduceat(face_recognition.face_distance(known, e), starts) for e in encs])
+            hits = match_faces(P, LOOSE, MARGIN)
+        else:
+            hits = []
+        for (t, r_, b, l), hit, e in zip(locs, hits, encs):
+            if hit is not None:
+                col, d, close, jcol = hit
+                i = int(ids[col])
                 if d < best[i]:
                     best[i], amb[i] = d, close
                 status = "present" if (d <= STRICT and not close) else "check"
                 label = rows[i]["name"]
                 if status == "check":
                     label += " ?"
-                    if close and j is not None:
-                        label += f" (like {rows[j]['name']})"
+                    if close and jcol is not None:
+                        label += f" (like {rows[int(ids[jcol])]['name']})"
                 color = "lime" if status == "present" else "orange"
             else:
+                i, d = 0, float(np.min(face_recognition.face_distance(known, e)))
                 status, label, color = "unknown", "Unknown", "red"
             draw.rectangle((l, t, r_, b), outline=color, width=4)
             draw.text((l, b + 4), label, fill=color, font=font)
             faces.append({"photo": f.filename, "status": status, "label": label,
                           "reg_no": rows[i]["reg_no"] if status != "unknown" else None,
                           "distance": round(d, 3)})
+        del orig
         buf = io.BytesIO()
         pil.save(buf, "JPEG", quality=85)
         annotated.append(base64.b64encode(buf.getvalue()).decode())
