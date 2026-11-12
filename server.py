@@ -197,6 +197,16 @@ def login(staff_id: str = Form(...), password: str = Form(...)):
             "role": row["role"] or "faculty"}
 
 
+@app.post("/verify-password")
+def verify_password(password: str = Form(...), staff: str = Depends(current_staff)):
+    """Used by the student self-mark screen: only the signed-in teacher's own password unlocks the phone."""
+    with db() as con:
+        row = con.execute("SELECT salt, pw_hash FROM staff WHERE staff_id=?", (staff,)).fetchone()
+    if not row or hash_pw(password, row["salt"]) != row["pw_hash"]:
+        raise HTTPException(401, "Wrong password")
+    return {"ok": True}
+
+
 # ---------- faculty accounts (head only) ----------
 @app.get("/staff")
 def list_staff(head: str = Depends(admin_staff)):
