@@ -569,6 +569,46 @@ def student_photos(class_name: str, staff: str = Depends(current_staff)):
     return {r["reg_no"]: r["photo"] for r in rows}
 
 
+@app.post("/verify-face")
+async def verify_face(reg_no: str = Form(...), photo: UploadFile = File(...),
+                      staff: str = Depends(current_staff)):
+    """One student, one small selfie: is it really them? Compares against that student (and their
+    classmates, to name a look-alike) only, so it is light enough for a small free server."""
+    with db() as con:
+        st = con.execute(f"SELECT reg_no, name, class_name, encodings, photo, {HAS_FACE} AS has_face "
+                         "FROM students WHERE reg_no=?", (reg_no,)).fetchone()
+        mine = visible_classes(con, staff)
+        if not st or (mine is not None and st["class_name"] not in mine):
+            raise HTTPException(404, "Student not found in your classes")
+        if not st["has_face"]:
+            return {"result": "no_face_data"}
+        mates = con.execute(f"SELECT reg_no, name, encodings FROM students WHERE class_name=? "
+                            f"AND reg_no != ? AND {HAS_FACE}", (st["class_name"], reg_no)).fetchall()
+    img = np.array(read_image(await photo.read(), 640))
+    locs = face_recognition.face_locations(img, number_of_times_to_upsample=1)
+    if not locs:
+        return {"result": "no_face"}
+    loc = max(locs, key=lambda b: (b[2] - b[0]) * (b[1] - b[3]))       # the biggest face is the student
+    enc = face_recognition.face_encodings(img, [loc])[0]
+    d = float(np.min(face_recognition.face_distance(np.array(json.loads(st["encodings"])), enc)))
+    best_other, other_d = None, 9.0
+    for m in mates:
+        dm = float(np.min(face_recognition.face_distance(np.array(json.loads(m["encodings"])), enc)))
+        if dm < other_d:
+            best_other, other_d = m, dm
+    if best_other is not None and other_d < d and other_d <= LOOSE:
+        return {"result": "other", "distance": round(d, 3),
+                "looks_like": best_other["name"], "looks_like_reg": best_other["reg_no"]}
+    if d <= STRICT:
+        if not st["photo"]:      # first sure match: keep a small picture for the self-mark screen
+            with db() as con:
+                con.execute("UPDATE students SET photo=? WHERE reg_no=?", (face_thumb(img, loc), reg_no))
+        return {"result": "match", "distance": round(d, 3)}
+    if d <= LOOSE:
+        return {"result": "unsure", "distance": round(d, 3)}
+    return {"result": "no_match", "distance": round(d, 3)}
+
+
 @app.delete("/students/{reg_no}/faces")
 def delete_faces(reg_no: str, staff: str = Depends(current_staff)):
     """Removes only the stored face data, the student stays in the class so new photos can be added."""
