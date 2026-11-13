@@ -571,7 +571,7 @@ def student_photos(class_name: str, staff: str = Depends(current_staff)):
 
 @app.post("/verify-face")
 async def verify_face(reg_no: str = Form(...), photo: UploadFile = File(...),
-                      staff: str = Depends(current_staff)):
+                      enroll: int = Form(0), staff: str = Depends(current_staff)):
     """One student, one small selfie: is it really them? Compares against that student (and their
     classmates, to name a look-alike) only, so it is light enough for a small free server."""
     with db() as con:
@@ -580,7 +580,7 @@ async def verify_face(reg_no: str = Form(...), photo: UploadFile = File(...),
         mine = visible_classes(con, staff)
         if not st or (mine is not None and st["class_name"] not in mine):
             raise HTTPException(404, "Student not found in your classes")
-        if not st["has_face"]:
+        if not st["has_face"] and not enroll:
             return {"result": "no_face_data"}
         mates = con.execute(f"SELECT reg_no, name, encodings FROM students WHERE class_name=? "
                             f"AND reg_no != ? AND {HAS_FACE}", (st["class_name"], reg_no)).fetchall()
@@ -590,7 +590,20 @@ async def verify_face(reg_no: str = Form(...), photo: UploadFile = File(...),
         return {"result": "no_face"}
     loc = max(locs, key=lambda b: (b[2] - b[0]) * (b[1] - b[3]))       # the biggest face is the student
     enc = face_recognition.face_encodings(img, [loc])[0]
-    d = float(np.min(face_recognition.face_distance(np.array(json.loads(st["encodings"])), enc)))
+    if not st["has_face"]:
+        # first time for this student: save this face as theirs, unless it already belongs to someone else
+        with db() as con:
+            others = con.execute(f"SELECT reg_no, name, encodings FROM students WHERE reg_no != ? AND {HAS_FACE}",
+                                 (reg_no,)).fetchall()
+        for o in others:
+            if float(np.min(face_recognition.face_distance(np.array(json.loads(o["encodings"])), enc))) < DUP_DIST:
+                return {"result": "other", "looks_like": o["name"], "looks_like_reg": o["reg_no"]}
+        with db() as con:
+            con.execute("UPDATE students SET encodings=?, photo=? WHERE reg_no=?",
+                        (json.dumps([enc.tolist()]), face_thumb(img, loc), reg_no))
+        return {"result": "enrolled"}
+    known = json.loads(st["encodings"])
+    d = float(np.min(face_recognition.face_distance(np.array(known), enc)))
     best_other, other_d = None, 9.0
     for m in mates:
         dm = float(np.min(face_recognition.face_distance(np.array(json.loads(m["encodings"])), enc)))
@@ -600,9 +613,12 @@ async def verify_face(reg_no: str = Form(...), photo: UploadFile = File(...),
         return {"result": "other", "distance": round(d, 3),
                 "looks_like": best_other["name"], "looks_like_reg": best_other["reg_no"]}
     if d <= STRICT:
-        if not st["photo"]:      # first sure match: keep a small picture for the self-mark screen
-            with db() as con:
+        with db() as con:
+            if not st["photo"]:      # first sure match: keep a small picture for the self-mark screen
                 con.execute("UPDATE students SET photo=? WHERE reg_no=?", (face_thumb(img, loc), reg_no))
+            if len(known) < 5:       # a few more sure samples make later checks steadier
+                con.execute("UPDATE students SET encodings=? WHERE reg_no=?",
+                            (json.dumps(known + [enc.tolist()]), reg_no))
         return {"result": "match", "distance": round(d, 3)}
     if d <= LOOSE:
         return {"result": "unsure", "distance": round(d, 3)}
