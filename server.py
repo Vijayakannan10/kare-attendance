@@ -62,6 +62,8 @@ def init_db():
         cols = [r["name"] for r in con.execute("PRAGMA table_info(students)")]
         if "class_name" not in cols:
             con.execute("ALTER TABLE students ADD COLUMN class_name TEXT DEFAULT 'General'")
+        if "photo" not in cols:   # small face picture shown when a student marks themselves
+            con.execute("ALTER TABLE students ADD COLUMN photo TEXT DEFAULT ''")
         con.execute("UPDATE students SET class_name='General' WHERE class_name IS NULL OR class_name=''")
         con.execute("""CREATE TABLE IF NOT EXISTS class_access(
             class_name TEXT, staff_id TEXT, PRIMARY KEY(class_name, staff_id))""")
@@ -263,6 +265,18 @@ def read_image(data: bytes, max_side: int) -> Image.Image:
     img = ImageOps.exif_transpose(Image.open(io.BytesIO(data)).convert("RGB"))  # fixes phone rotation
     img.thumbnail((max_side, max_side))
     return img
+
+
+def face_thumb(img: np.ndarray, loc, side: int = 128) -> str:
+    """A small square JPEG of the face (about 4 KB), as base64, for showing on screen."""
+    t, r, b, l = loc
+    m = int((b - t) * 0.45)
+    h, w = img.shape[:2]
+    crop = Image.fromarray(img[max(0, t - m):min(h, b + m), max(0, l - m):min(w, r + m)])
+    crop = ImageOps.fit(crop, (side, side))
+    buf = io.BytesIO()
+    crop.save(buf, "JPEG", quality=70)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 def photo_problem(img: np.ndarray, loc) -> Optional[str]:
@@ -492,7 +506,7 @@ async def register_student(name: str = Form(...), reg_no: str = Form(...),
         mine = visible_classes(con, staff)
     if old and mine is not None and old["class_name"] not in mine:
         raise HTTPException(403, "This register number belongs to another faculty's class.")
-    encs, problems = [], []
+    encs, problems, thumb = [], [], ""
     photos = [p for p in (photo1, photo2, photo3) if p is not None and p.filename]
     for f in photos:
         img = np.array(read_image(await f.read(), 1600))
@@ -505,6 +519,8 @@ async def register_student(name: str = Form(...), reg_no: str = Form(...),
             problems.append(f"{f.filename}: {why}")
             continue
         encs.append(face_recognition.face_encodings(img, locs, num_jitters=5)[0].tolist())
+        if not thumb:
+            thumb = face_thumb(img, locs[0])
     if len(encs) < 2:
         raise HTTPException(400, {"msg": "Need at least 2 clear front-face photos. Please retake:",
                                   "problems": problems})
@@ -521,8 +537,8 @@ async def register_student(name: str = Form(...), reg_no: str = Form(...),
                            "who is already registered. Check that these photos belong to the right student.",
                     "problems": []})
     with db() as con:
-        con.execute("""INSERT OR REPLACE INTO students(reg_no, name, encodings, added_by, class_name)
-                       VALUES(?,?,?,?,?)""", (reg_no, name, json.dumps(encs), staff, class_name))
+        con.execute("""INSERT OR REPLACE INTO students(reg_no, name, encodings, added_by, class_name, photo)
+                       VALUES(?,?,?,?,?,?)""", (reg_no, name, json.dumps(encs), staff, class_name, thumb))
     return {"ok": True, "name": name, "reg_no": reg_no, "class_name": class_name,
             "photos_used": len(encs), "problems": problems}
 
@@ -541,6 +557,18 @@ def list_students(class_name: Optional[str] = None, staff: str = Depends(current
             if mine is None or r["class_name"] in mine]
 
 
+@app.get("/students/photos")
+def student_photos(class_name: str, staff: str = Depends(current_staff)):
+    """Small face pictures of one class, fetched once when the self-mark screen opens."""
+    with db() as con:
+        mine = visible_classes(con, staff)
+        if mine is not None and class_name not in mine:
+            raise HTTPException(403, "Not your class")
+        rows = con.execute("SELECT reg_no, photo FROM students WHERE class_name=? AND photo != ''",
+                           (class_name,)).fetchall()
+    return {r["reg_no"]: r["photo"] for r in rows}
+
+
 @app.delete("/students/{reg_no}/faces")
 def delete_faces(reg_no: str, staff: str = Depends(current_staff)):
     """Removes only the stored face data, the student stays in the class so new photos can be added."""
@@ -549,7 +577,7 @@ def delete_faces(reg_no: str, staff: str = Depends(current_staff)):
     if r:
         need_class(staff, r["class_name"])
     with db() as con:
-        con.execute("UPDATE students SET encodings='[]' WHERE reg_no=?", (reg_no,))
+        con.execute("UPDATE students SET encodings='[]', photo='' WHERE reg_no=?", (reg_no,))
     return {"ok": True}
 
 
